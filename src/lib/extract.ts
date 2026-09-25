@@ -16,7 +16,9 @@ Only record facts literally stated in the email. If a field is not stated, use n
 
 Event kinds:
 - refund_promised: a merchant confirms a return, cancellation or refund request and says money will be returned (capture any stated timeframe).
-- refund_received: an email confirms money was refunded, credited or reversed to the customer (includes bank alerts of a refund/reversal/abono).
+- refund_received: an email confirms money WAS ALREADY refunded, credited or reversed (past tense: "hemos reembolsado", "has been refunded", "se abonó", bank alerts of a refund/reversal/abono).
+  If the email only says money WILL be returned ("será reembolsado", "will be refunded", "recibirás tu reembolso", an order or reservation cancelled with a deposit to be returned), that is refund_promised, not refund_received.
+  An order/reservation cancellation that mentions a deposit or payment to be returned is refund_promised.
 - charge: a bank or card alert of an approved purchase or charge (merchant, amount).
 - price_increase: notice that a subscription, plan or service will cost more (price_from, price_to, due_date = date the new price starts).
 - trial_started: a free trial that will turn into a paid plan (due_date = trial end date, amount = price per month after the trial).
