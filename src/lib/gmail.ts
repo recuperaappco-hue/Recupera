@@ -74,20 +74,28 @@ export async function gmailProfile(token: string) {
 }
 
 /** Searches narrow enough to skip personal mail. Spanish + English wording used by Colombian merchants and banks. */
-export const SEARCHES = [
-  'newer_than:1y (reembolso OR devolución OR devolucion OR reintegro OR "nota crédito" OR "nota credito" OR refund)',
-  'newer_than:6m ("compra aprobada" OR "compra por" OR "transacción aprobada" OR "transaccion aprobada" OR "realizaste una compra" OR "pago aprobado")',
-  'newer_than:1y ("factura electrónica" OR "factura electronica" OR "factura de venta" OR "documento electrónico" OR "documento electronico")',
-  'newer_than:6m ("nuevo precio" OR "cambio de precio" OR "ajuste de tarifa" OR "actualización de precio" OR "actualizacion de precio" OR "cambios en tu plan" OR "price increase" OR "precio de tu plan")',
-  'newer_than:4m ("prueba gratis" OR "periodo de prueba" OR "período de prueba" OR "free trial" OR "mes gratis" OR "días gratis")',
-  'newer_than:1y ("vuelo cancelado" OR "ha sido cancelado" OR "fue cancelado" OR "flight cancelled" OR "flight canceled" OR "no ha sido entregado" OR "retraso en tu pedido" OR "pedido cancelado")',
+/** Narrow searches: purchases, banks, refunds, prices, trials, travel. Spanish + English wording. */
+export const SEARCHES: { q: string; cap: number }[] = [
+  { cap: 300, q: 'newer_than:2y (reembolso OR devolución OR devolucion OR reintegro OR "nota crédito" OR "nota credito" OR refund OR refunded OR reimbursement OR "depósito" OR deposit)' },
+  { cap: 500, q: 'newer_than:6m ("compra aprobada" OR "compra por" OR "transacción aprobada" OR "transaccion aprobada" OR "realizaste una compra" OR "pago aprobado" OR "resumen de transacción" OR "you paid" OR "payment received" OR "your receipt")' },
+  { cap: 300, q: 'newer_than:2y ("factura electrónica" OR "factura electronica" OR "factura de venta" OR "documento electrónico" OR "documento electronico" OR invoice) has:attachment' },
+  { cap: 150, q: 'newer_than:6m ("nuevo precio" OR "cambio de precio" OR "ajuste de tarifa" OR "actualización de precio" OR "actualizacion de precio" OR "cambios en tu plan" OR "precio de tu plan" OR "price increase" OR "price change" OR "new price")' },
+  { cap: 100, q: 'newer_than:4m ("prueba gratis" OR "periodo de prueba" OR "período de prueba" OR "mes gratis" OR "días gratis" OR "free trial" OR "trial ends" OR "trial will end")' },
+  { cap: 150, q: 'newer_than:1y ("vuelo cancelado" OR "ha sido cancelado" OR "fue cancelado" OR "pedido cancelado" OR "no ha sido entregado" OR "retraso en tu pedido" OR "flight cancelled" OR "flight canceled" OR "order cancelled" OR "order canceled" OR "reservation cancelled")' },
 ];
 
-export async function listCandidateIds(token: string, maxTotal = 220): Promise<string[]> {
+/** Lists candidate emails. Every search gets its own quota so one busy search cannot starve the others. */
+export async function listCandidateIds(token: string, maxTotal = 1500): Promise<string[]> {
   const ids = new Set<string>();
-  for (const q of SEARCHES) {
-    const res = await gget<{ messages?: { id: string }[] }>(token, `/messages?maxResults=60&q=${encodeURIComponent(q)}`);
-    for (const m of res.messages ?? []) ids.add(m.id);
+  for (const { q, cap } of SEARCHES) {
+    let pageToken: string | undefined;
+    let got = 0;
+    do {
+      const url = `/messages?maxResults=100&q=${encodeURIComponent(q)}${pageToken ? `&pageToken=${pageToken}` : ""}`;
+      const res = await gget<{ messages?: { id: string }[]; nextPageToken?: string }>(token, url);
+      for (const m of res.messages ?? []) { ids.add(m.id); got++; }
+      pageToken = res.nextPageToken;
+    } while (pageToken && got < cap && ids.size < maxTotal);
     if (ids.size >= maxTotal) break;
   }
   return [...ids].slice(0, maxTotal);
