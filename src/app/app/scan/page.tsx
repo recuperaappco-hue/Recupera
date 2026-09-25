@@ -1,82 +1,72 @@
-import "server-only";
-import { adminClient } from "./supabase/admin";
-import { decrypt } from "./crypto";
-import { accessTokenFromRefresh, fetchMessage, listCandidateIds, pool, ReconnectNeeded, type MailItem } from "./gmail";
-import { extractBatch } from "./extract";
-import { buildFindings, type EmailEvent } from "./rules";
-import { todayISO } from "./dates";
+"use client";
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { Icon } from "@/components/Icon";
 
-const MAX_NEW_PER_SCAN = 120;
-const BATCH = 6;
+type Stats = { checked: number; processed: number; relevant: number; findings: number; warranties: number; remaining: number };
+const STEPS = ["Buscando facturas electrónicas", "Leyendo alertas del banco", "Revisando devoluciones y reembolsos", "Revisando suscripciones y tarifas", "Armando tu inventario de garantías"];
 
-export type ScanStats = { checked: number; processed: number; relevant: number; findings: number; warranties: number; remaining: number };
+export default function Scan() {
+  const [state, setState] = useState<"running" | "done" | "reconnect" | "error">("running");
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [step, setStep] = useState(0);
+  const started = useRef(false);
 
-export async function runScan(userId: string): Promise<ScanStats> {
-  const db = adminClient();
-  const { data: conn } = await db.from("gmail_connections").select("*").eq("user_id", userId).single();
-  if (!conn) throw new ReconnectNeeded("no connection");
-
-  let token: string;
-  try {
-    token = await accessTokenFromRefresh(decrypt(conn.refresh_token_enc));
-  } catch (e) {
-    if (e instanceof ReconnectNeeded) await db.from("gmail_connections").update({ status: "expired" }).eq("user_id", userId);
-    throw e;
+  // Runs scan rounds until the mailbox is done (each round reads up to 120 new emails).
+  async function run() {
+    setState("running"); setStep(0);
+    const tick = setInterval(() => setStep((st) => Math.min(st + 1, STEPS.length - 1)), 6000);
+    let total: Stats | null = null;
+    try {
+      for (let round = 0; round < 15; round++) {
+        const r = await fetch("/api/scan", { method: "POST" });
+        if (r.status === 409) return setState("reconnect");
+        if (!r.ok) { if (total) break; return setState("error"); }
+        const s: Stats = await r.json();
+        total = total
+          ? { ...s, processed: total.processed + s.processed, relevant: total.relevant + s.relevant }
+          : s;
+        setStats(total);
+        if (s.remaining === 0 || s.processed === 0) break;
+      }
+      setStep(STEPS.length); setState("done");
+    } catch { setState(total ? "done" : "error"); } finally { clearInterval(tick); }
   }
+  useEffect(() => { if (!started.current) { started.current = true; run(); } }, []);
 
-  // 1. Candidate emails from narrow Gmail searches.
-  const ids = await listCandidateIds(token);
-
-  // 2. Skip emails already processed in earlier scans (saves AI cost).
-  const done = new Set<string>();
-  for (let i = 0; i < ids.length; i += 100) {
-    const { data } = await db.from("email_events").select("gmail_id").eq("user_id", userId).in("gmail_id", ids.slice(i, i + 100));
-    data?.forEach((r) => done.add(r.gmail_id));
-  }
-  const fresh = ids.filter((id) => !done.has(id));
-  const now = fresh.slice(0, MAX_NEW_PER_SCAN);
-
-  // 3. Fetch and read.
-  const mails = (await pool(now, 8, (id) => fetchMessage(token, id).catch(() => null))).filter(Boolean) as MailItem[];
-  const batches: MailItem[][] = [];
-  for (let i = 0; i < mails.length; i += BATCH) batches.push(mails.slice(i, i + BATCH));
-  const results = await pool(batches, 4, async (b) => {
-    try { return { ok: true, mails: b, events: await extractBatch(b), err: "" }; }
-    catch (err) { console.error("extract failed", err); return { ok: false, mails: b, events: [] as EmailEvent[], err: String((err as Error)?.message ?? err) }; }
-  });
-  if (results.length && results.every((r) => !r.ok)) throw new Error("ai_failed: " + results[0].err.slice(0, 300));
-  const events = results.flatMap((r) => r.events);
-
-  // 4. Store facts only. Emails the AI read without finding anything get a marker row so they are not re-read.
-  //    Emails from failed AI batches get no marker, so the next scan retries them.
-  const withEvents = new Set(events.map((e) => e.gmail_id));
-  const readOk = results.filter((r) => r.ok).flatMap((r) => r.mails);
-  const rows = [
-    ...events.map((e) => ({ ...e, user_id: userId, item_key: `${e.product ?? ""}|${e.amount ?? ""}` })),
-    ...readOk.filter((m) => !withEvents.has(m.id)).map((m) => ({ user_id: userId, gmail_id: m.id, kind: "none", received_at: m.receivedAt, item_key: "" })),
-  ];
-  for (let i = 0; i < rows.length; i += 200) {
-    const { error } = await db.from("email_events").upsert(rows.slice(i, i + 200), { onConflict: "user_id,gmail_id,kind,item_key", ignoreDuplicates: true });
-    if (error) console.error("email_events upsert", error.message);
-  }
-
-  // 5. Rebuild findings from all stored facts. Existing findings keep their status.
-  const { data: all } = await db.from("email_events").select("*").eq("user_id", userId).neq("kind", "none");
-  const { findings, warranties } = buildFindings((all ?? []) as EmailEvent[], todayISO());
-  if (findings.length) {
-    const { error } = await db.from("findings").upsert(findings.map((f) => ({ ...f, user_id: userId })), { onConflict: "user_id,dedupe_key", ignoreDuplicates: true });
-    if (error) console.error("findings upsert", error.message);
-  }
-  if (warranties.length) {
-    const { error } = await db.from("warranties").upsert(warranties.map((w) => ({ ...w, user_id: userId })), { onConflict: "user_id,dedupe_key", ignoreDuplicates: true });
-    if (error) console.error("warranties upsert", error.message);
-  }
-
-  const stats: ScanStats = {
-    checked: ids.length, processed: mails.length, relevant: withEvents.size,
-    findings: findings.length, warranties: warranties.length, remaining: Math.max(0, fresh.length - now.length),
-  };
-  await db.from("gmail_connections").update({ last_scan_at: new Date().toISOString(), last_scan_stats: stats, status: "active" }).eq("user_id", userId);
-  await db.from("audit_log").insert({ user_id: userId, action: "scan", detail: stats });
-  return stats;
+  return (
+    <main>
+      <div className={`scan ${state !== "running" ? "done" : ""}`}>
+        <div className="radar"><Icon id="i-mail" /></div>
+        <div style={{ textAlign: "center" }}>
+          <h2 className="s-title">
+            {state === "running" && "Revisando tu correo…"}
+            {state === "done" && (stats!.findings + stats!.warranties > 0 ? `Encontramos ${stats!.findings + stats!.warranties} cosas` : "Revisión terminada")}
+            {state === "reconnect" && "Necesitamos que vuelvas a conectar tu correo"}
+            {state === "error" && "No pudimos terminar la revisión"}
+          </h2>
+          {state === "running" && <p className="s-sub" style={{ marginTop: 6 }}>{stats ? `Seguimos: ${stats.remaining} correos por leer.` : "Puede tardar unos minutos."} No cierres esta pantalla.</p>}
+        </div>
+        {stats && (
+          <div className="counters num">
+            <div><b>{stats.processed}</b><span>Correos leídos</span></div>
+            <div><b>{stats.relevant}</b><span>Con datos útiles</span></div>
+            <div><b>{stats.findings + stats.warranties}</b><span>Hallazgos</span></div>
+          </div>
+        )}
+        <ul className="scanlog">
+          {STEPS.map((t, i) => (
+            <li key={t} className={i < step || state === "done" ? "ok" : ""}><i>{i < step || state === "done" ? "✓" : ""}</i>{t}</li>
+          ))}
+        </ul>
+      </div>
+      <div className="foot">
+        {state === "done" && <Link className="btn btn-green btn-block" href="/app">Ver lo que encontramos</Link>}
+        {state === "done" && stats!.remaining > 0 && <button className="btn btn-ghost btn-block" onClick={run}>Revisar {stats!.remaining} correos más</button>}
+        {state === "reconnect" && <Link className="btn btn-green btn-block" href="/app/connect">Conectar de nuevo</Link>}
+        {state === "error" && <button className="btn btn-green btn-block" onClick={run}>Intentar de nuevo</button>}
+        {state === "running" && <button className="btn btn-green btn-block" disabled>Revisando…</button>}
+      </div>
+    </main>
+  );
 }
