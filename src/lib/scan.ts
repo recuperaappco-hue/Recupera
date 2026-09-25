@@ -6,7 +6,7 @@ import { extractBatch } from "./extract";
 import { buildFindings, type EmailEvent } from "./rules";
 import { todayISO } from "./dates";
 
-const MAX_NEW_PER_SCAN = 160;
+const MAX_NEW_PER_SCAN = 120;
 const BATCH = 6;
 
 export type ScanStats = { checked: number; processed: number; relevant: number; findings: number; warranties: number; remaining: number };
@@ -40,13 +40,20 @@ export async function runScan(userId: string): Promise<ScanStats> {
   const mails = (await pool(now, 8, (id) => fetchMessage(token, id).catch(() => null))).filter(Boolean) as MailItem[];
   const batches: MailItem[][] = [];
   for (let i = 0; i < mails.length; i += BATCH) batches.push(mails.slice(i, i + BATCH));
-  const events = (await pool(batches, 4, (b) => extractBatch(b).catch((err) => { console.error("extract failed", err); return [] as EmailEvent[]; }))).flat();
+  const results = await pool(batches, 4, async (b) => {
+    try { return { ok: true, mails: b, events: await extractBatch(b), err: "" }; }
+    catch (err) { console.error("extract failed", err); return { ok: false, mails: b, events: [] as EmailEvent[], err: String((err as Error)?.message ?? err) }; }
+  });
+  if (results.length && results.every((r) => !r.ok)) throw new Error("ai_failed: " + results[0].err.slice(0, 300));
+  const events = results.flatMap((r) => r.events);
 
-  // 4. Store facts only. Emails without events get a marker row so they are not re-read.
+  // 4. Store facts only. Emails the AI read without finding anything get a marker row so they are not re-read.
+  //    Emails from failed AI batches get no marker, so the next scan retries them.
   const withEvents = new Set(events.map((e) => e.gmail_id));
+  const readOk = results.filter((r) => r.ok).flatMap((r) => r.mails);
   const rows = [
     ...events.map((e) => ({ ...e, user_id: userId, item_key: `${e.product ?? ""}|${e.amount ?? ""}` })),
-    ...mails.filter((m) => !withEvents.has(m.id)).map((m) => ({ user_id: userId, gmail_id: m.id, kind: "none", received_at: m.receivedAt, item_key: "" })),
+    ...readOk.filter((m) => !withEvents.has(m.id)).map((m) => ({ user_id: userId, gmail_id: m.id, kind: "none", received_at: m.receivedAt, item_key: "" })),
   ];
   for (let i = 0; i < rows.length; i += 200) {
     const { error } = await db.from("email_events").upsert(rows.slice(i, i + 200), { onConflict: "user_id,gmail_id,kind,item_key", ignoreDuplicates: true });
