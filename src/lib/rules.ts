@@ -63,6 +63,10 @@ export function sameMerchant(a: string | null, b: string | null) {
   const fx = x.split(" ")[0], fy = y.split(" ")[0];
   return fx.length >= 4 && fx === fy;
 }
+export function senderDomain(from: string) {
+  const m = from.toLowerCase().match(/@([a-z0-9.-]+)/);
+  return m ? m[1].split(".").slice(-3).join(".") : from.toLowerCase().trim();
+}
 const sameAmount = (a: number | null, b: number | null) => a != null && b != null && Math.abs(a - b) <= Math.max(1, a * 0.01);
 const ev = (e: EmailEvent): Evidence => ({ gmail_id: e.gmail_id, subject: e.subject, sender: e.sender, date: e.received_at.slice(0, 10), snippet: e.snippet });
 const key = (...p: (string | number | null | undefined)[]) => p.map((x) => normMerchant(String(x ?? ""))).join("|");
@@ -114,6 +118,13 @@ export function buildFindings(events: EmailEvent[], today: string): { findings: 
       const mins = (Date.parse(b.received_at) - Date.parse(a.received_at)) / 60000;
       if (mins > 15) break;
       if (a.gmail_id === b.gmail_id || !sameAmount(a.amount, b.amount) || !sameMerchant(a.merchant, b.merchant)) continue;
+      // A real double charge produces two alerts from the SAME sender (your bank). A bank alert plus the
+      // merchant's receipt, or a PSE confirmation, is one payment described twice.
+      if (senderDomain(a.sender) !== senderDomain(b.sender)) continue;
+      // Habitual purchases (car wash, parking, tolls, coffee): if the same merchant and amount show up on
+      // 3 or more different days, two close charges are likely two real purchases, not an error.
+      const days = new Set(charges.filter((c) => sameMerchant(c.merchant, a.merchant) && sameAmount(c.amount, a.amount)).map((c) => c.received_at.slice(0, 10)));
+      if (days.size >= 3) continue;
       if (refundedAfter(events, b)) continue;
       const d = a.received_at.slice(0, 10);
       push({
